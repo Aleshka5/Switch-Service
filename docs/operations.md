@@ -52,6 +52,10 @@ make run
 .venv/bin/switch-service logs alpha --tail 50
 ```
 
+Реальные модели живут в одной сети, и её тоже готовит это меню: `make doctor` (GPU, сокет, образы, порты, каталог),
+`make network` (создать `models_network` и подключить потребителей), `make network-status` (состав и ответы health-портов).
+Почему без compose и почему пробы идут через `127.0.0.1` — [models-network.md](models-network.md).
+
 `state` ждёт завершения и печатает итог. `--no-wait` только ставит переход в очередь. `--evict beta` разрешает остановить beta, если иначе не хватает памяти. `--force` нужен для профиля с `available: false` и для сервиса с `preemptible: false`.
 
 Демо-каталог `config/services.yaml` не смотрит на реальную машину (`sample: fixture`) и не вызывает podman (`RUNTIME=fake` по умолчанию). Цифры RAM/VRAM в `status` — учебные, зато треугольник и отказы `409` видны сразу.

@@ -14,6 +14,8 @@ from switch_service.errors import CatalogError
 
 _ID = re.compile(r"^[a-z][a-z0-9_-]{0,40}$")
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_IPV4 = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
+_SUBNET = re.compile(r"^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$")
 _MODES = ("cpu", "gpu")
 
 
@@ -41,7 +43,7 @@ class Profile:
     devices: tuple[str, ...]
     binds: tuple[tuple[str, str, bool], ...]
     volumes: tuple[tuple[str, str, bool], ...]
-    ports: tuple[tuple[int, int], ...]
+    ports: tuple[tuple[str | None, int, int], ...]
     memory_limit_mib: int
     shm_size_mib: int | None
     claim_ram_mib: int
@@ -94,6 +96,8 @@ class HostSpec:
     observe_cache_s: float
     sample: str
     fixture: Fixture | None
+    network: str | None = None
+    network_subnet: str | None = None
 
 
 @dataclass
@@ -219,6 +223,8 @@ def _host(raw: dict[str, Any]) -> HostSpec:
         observe_cache_s=float(raw.get("observe_cache_s", 2)),
         sample=sample,
         fixture=fixture,
+        network=_network_name(raw.get("network")),
+        network_subnet=_subnet(raw.get("network_subnet")),
     )
 
 
@@ -349,21 +355,55 @@ def _volume(service_id: str, text: str) -> tuple[str, str, bool, str]:
     return source, dest, mode == "ro", kind
 
 
-def _port(service_id: str, text: str) -> tuple[int, int]:
+def _port(service_id: str, text: str) -> tuple[str | None, int, int]:
+    """``host:container``, ``ip:host:container`` or a bare container port.
+
+    The optional host IP exists so a health probe can be published on loopback
+    only: rootless podman cannot be reached by container IP from the host, and
+    it does not resolve container names on the host either.
+    """
     parts = str(text).split(":")
-    if len(parts) == 2:
+    host_ip: str | None = None
+    if len(parts) == 1:
+        host, container = None, parts[0]
+    elif len(parts) == 2:
         host, container = parts
     elif len(parts) == 3:
-        host, container = parts[1], parts[2]
+        host_ip, host, container = parts
+        if not _IPV4.match(host_ip):
+            raise CatalogError(f"{service_id}: bad host ip in port {text!r}")
     else:
         raise CatalogError(f"{service_id}: bad port {text!r}")
     try:
-        host_port, container_port = int(host), int(container)
+        host_port = None if host in (None, "") else int(host)
+        container_port = int(container)
     except ValueError as exc:
         raise CatalogError(f"{service_id}: bad port {text!r}") from exc
-    if not (1 <= host_port <= 65535 and 1 <= container_port <= 65535):
+    if not (1 <= container_port <= 65535):
         raise CatalogError(f"{service_id}: port out of range {text}")
-    return host_port, container_port
+    if host_port is not None:
+        if not (1 <= host_port <= 65535):
+            raise CatalogError(f"{service_id}: port out of range {text}")
+        return host_ip, host_port, container_port
+    return host_ip, container_port, container_port
+
+
+def _network_name(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    name = str(value).strip()
+    if not _ID.match(name):
+        raise CatalogError(f"host.network {name!r} is not a safe network name")
+    return name
+
+
+def _subnet(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not _SUBNET.match(text):
+        raise CatalogError(f"host.network_subnet {text!r} is not an IPv4 subnet")
+    return text
 
 
 def _size_mib(value: Any) -> int:

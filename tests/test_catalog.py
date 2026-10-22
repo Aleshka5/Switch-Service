@@ -94,7 +94,7 @@ def test_podman_payload_uses_cdi_and_does_not_restart():
         devices=("nvidia.com/gpu=all",),
         binds=(("/models", "/models", True),),
         volumes=(),
-        ports=((4001, 4001),),
+        ports=((None, 4001, 4001),),
         memory_limit_mib=4096,
         shm_size_mib=None,
         health_url=None,
@@ -109,6 +109,101 @@ def test_podman_payload_uses_cdi_and_does_not_restart():
     assert body["resource_limits"]["memory"]["limit"] == 4096 * 1024 * 1024
     assert body["networks"] == {"llm_network": {}}
     assert body["labels"]["switch.config-hash"] == spec.config_hash
+
+
+def test_loopback_port_mapping_and_shared_network(tmp_path):
+    """A health port may be published on loopback only, and the network is created once."""
+    catalog = Catalog.from_dict(
+        {
+            "host": {
+                "ram_reserve_mib": 1,
+                "vram_reserve_mib": 0,
+                "sample": "live",
+                "network": "models_network",
+            },
+            "services": [
+                {
+                    "id": "ocr",
+                    "health": {"url": "http://127.0.0.1:18090/health", "timeout_s": 1},
+                    "profiles": {
+                        "cpu": {
+                            "image": "demo",
+                            "ports": ["127.0.0.1:18090:8090", "9000:9000"],
+                            "claim": {"ram_mib": 1, "vram_mib": 0},
+                        }
+                    },
+                }
+            ],
+        }
+    )
+    assert catalog.host.network == "models_network"
+    profile = catalog.get("ocr").profiles["cpu"]
+    assert profile.ports == (("127.0.0.1", 18090, 8090), (None, 9000, 9000))
+
+    spec = ContainerSpec(
+        name="ocr",
+        service_id="ocr",
+        mode="cpu",
+        image="demo",
+        command=(),
+        env=(),
+        networks=("models_network",),
+        devices=(),
+        binds=(),
+        volumes=(),
+        ports=profile.ports,
+        memory_limit_mib=None,
+        shm_size_mib=None,
+        health_url=None,
+        health_timeout_s=1,
+        stop_grace_s=1,
+    )
+    body = podman_payload(spec)
+    assert body["portmappings"] == [
+        {"host_port": 18090, "container_port": 8090, "protocol": "tcp", "host_ip": "127.0.0.1"},
+        {"host_port": 9000, "container_port": 9000, "protocol": "tcp"},
+    ]
+
+    with pytest.raises(CatalogError):
+        Catalog.from_dict(
+            {
+                "host": {"ram_reserve_mib": 1, "vram_reserve_mib": 0, "sample": "live"},
+                "services": [
+                    {
+                        "id": "ocr",
+                        "profiles": {
+                            "cpu": {
+                                "image": "demo",
+                                "ports": ["localhost:18090:8090"],
+                                "claim": {"ram_mib": 1, "vram_mib": 0},
+                            }
+                        },
+                    }
+                ],
+            }
+        )
+
+
+def test_network_is_ensured_before_the_first_container(tmp_path):
+    from switch_service.runtime import FakeRuntime
+    from tests.conftest import make_core, service
+
+    core = make_core(tmp_path, [service("alpha")], network="models_network")
+    runtime = core.runtime
+    assert isinstance(runtime, FakeRuntime)
+    try:
+        core.set_state("alpha", "cpu")
+        kinds = [call[0] for call in runtime.calls]
+        assert kinds[0] == "ensure_network"
+        assert runtime.calls[0][1] == "models_network"
+        assert "ensure" in kinds[1:]
+
+        core.set_state("alpha", "off")
+        core.set_state("alpha", "gpu")
+        created = [call for call in runtime.calls if call[0] == "ensure_network"]
+        assert len(created) == 1, "the network must be created only once per process"
+    finally:
+        core.close()
 
 
 def test_parsers_and_redaction():

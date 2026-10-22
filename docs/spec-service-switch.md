@@ -193,7 +193,16 @@ free    = budget - сумма резервов других ready/starting/stopp
 
 - Профиля `off` нет: это отсутствие контейнера.
 - `command` заменяет команду контейнера. Для своих образов OCR/embedder его нет, режим — переменная окружения.
+- Один образ может обслуживать оба режима: у OCR и embedder это CUDA-сборка (`:cuda`) с переменной `OCR_LLAMA_NGL` /
+  `EMBEDDING_LLAMA_NGL` (`0` — CPU, `999`/`-1` — все слои на GPU). Каталог различает режимы только env и `devices`,
+  пересборка при переключении не нужна.
 - Устройство GPU — строка CDI в `devices`, не `deploy.resources`.
+- `host.network` — одна именованная bridge-сеть на все сервисы. Создаётся самим сервисом (идемпотентно, до первого
+  контейнера) через libpod API; `host.network_subnet` необязателен и только для фиксированной подсети.
+- `ports` понимает три формы: `container`, `host:container`, `ip:host:container`. Третья — единственный способ отдать
+  порт наружу и оставить его на loopback: `"127.0.0.1:18090:8090"`. Пробы живости в общем случае идут именно так,
+  потому что из rootless-контейнера имя не резолвится на хосте, а IP контейнера с хоста недостижим
+  (см. [models-network.md](models-network.md)).
 - `memory_limit_mib` по умолчанию = клейм RAM + `memory_headroom_mib` (2048). Это cgroup, не клейм admission.
 - `restart_policy` всегда `no`. Поднимает reconciler, не podman. Иначе `off` недостижим (`Restart=always` у quadlet image).
 - Имена контейнеров задаёт каталог. Кто ещё делает `podman start` этих имён, ломает инвариант «писатель один».
@@ -205,6 +214,10 @@ free    = budget - сумма резервов других ready/starting/stopp
 ## 7. Рантайм и загрузка
 
 `SWITCH_RUNTIME=fake` (по умолчанию для `make run`) ничего не запускает. `podman` ходит в libpod API по unix-сокету (`CONTAINER_HOST` или `/run/user/$UID/podman/podman.sock`).
+
+Перед первым контейнером создаётся `host.network`, если его нет: `GET /libpod/networks/{name}/json`, при `404` —
+`POST /libpod/networks/create`. Ответ `409` значит, что сеть создал кто-то другой, и это тоже успех. Проверка одна на
+процесс, поэтому сеть можно не создавать ни compose, ни скриптом.
 
 Reconciler (`reconcile_interval_s`, по умолчанию 15 с):
 

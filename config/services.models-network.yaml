@@ -1,0 +1,241 @@
+# Real catalogue for master-node: every managed model lives in one bridge
+# network, `models_network`. No compose file, no quadlet: this file plus the
+# switch service is the whole topology.
+#
+#   make network          # create the network and attach the consumers
+#   make run RUNTIME=podman CONFIG=config/services.models-network.yaml
+#
+# Names inside models_network are the container names below (`ocr`,
+# `embedding`, `qwen38`, `qwen-image`). Consumers resolve them by that name:
+# rag-chat processor -> http://ocr:8090, chat -> http://embedding:8091,
+# gateway -> http://qwen38:4001 and http://qwen-image:8000.
+#
+# Health probes do not go over that network: a rootless podman container is
+# not reachable from the host by IP, and container names do not resolve on the
+# host. Each service therefore publishes its health port on 127.0.0.1 only
+# (rootlessport), and `health.url` points there. See docs/models-network.md.
+#
+# Claims: OCR/embedder RAM are measured (1.26 GiB and 630 MiB idle). The image
+# service runs MEMORY_MODE=offload, so its GPU footprint is about 8-10 GiB, not
+# the 20 GiB of the int8 mode. LLM weights are 27.05 GiB.
+
+host:
+  ram_reserve_mib: 8192
+  vram_reserve_mib: 1536
+  vram_device: 0
+  reconcile_interval_s: 15
+  observe_cache_s: 2
+  sample: live
+  network: models_network
+
+defaults:
+  stop_grace_s: 30
+  startup_timeout_s: 300
+  health_timeout_s: 5
+  health_interval_s: 2
+  memory_headroom_mib: 2048
+
+services:
+  - id: ocr
+    title: "OCR (Surya OCR 2)"
+    kind: ocr
+    container_name: ocr
+    preemptible: true
+    consumers: ["rag-chat processor"]
+    notes:
+      - "weights 1.18 GiB + 0.19 GiB mmproj, cached in rag-chat_ocr-model-cache"
+      - "cold start can take minutes; the model is not re-downloaded after a recreate"
+      - "one CUDA image serves both modes: OCR_LLAMA_NGL=0 offloads to CPU, 999 puts all layers on the GPU"
+    health: {url: "http://127.0.0.1:18090/health", timeout_s: 5}
+    profiles:
+      cpu:
+        available: true
+        image: localhost/rag-chat_ocr:cuda
+        networks: [models_network]
+        ports: ["127.0.0.1:18090:8090"]
+        volumes: ["rag-chat_ocr-model-cache:/var/cache/huggingface"]
+        env:
+          OCR_PORT: "8090"
+          OCR_TIMEOUT: "360"
+          OCR_MODEL: "surya-ocr-2"
+          OCR_LLAMA_URL: "http://127.0.0.1:8092"
+          OCR_LLAMA_NGL: "0"
+          HF_HOME: "/var/cache/huggingface"
+          HF_HUB_CACHE: "/var/cache/huggingface/hub"
+          HF_TOKEN: "${HF_TOKEN}"
+        claim: {ram_mib: 4096, vram_mib: 0}
+        startup_timeout_s: 900
+      gpu:
+        image: localhost/rag-chat_ocr:cuda
+        networks: [models_network]
+        ports: ["127.0.0.1:18090:8090"]
+        devices: ["nvidia.com/gpu=all"]
+        volumes: ["rag-chat_ocr-model-cache:/var/cache/huggingface"]
+        env:
+          OCR_PORT: "8090"
+          OCR_TIMEOUT: "360"
+          OCR_MODEL: "surya-ocr-2"
+          OCR_LLAMA_URL: "http://127.0.0.1:8092"
+          OCR_LLAMA_NGL: "999"
+          HF_HOME: "/var/cache/huggingface"
+          HF_HUB_CACHE: "/var/cache/huggingface/hub"
+          HF_TOKEN: "${HF_TOKEN}"
+        claim: {ram_mib: 1024, vram_mib: 3072}
+        startup_timeout_s: 900
+
+  - id: embedding
+    title: "Embedder (EmbeddingGemma 2)"
+    kind: embedding
+    container_name: embedding
+    preemptible: true
+    consumers: ["rag-chat chat", "rag-chat processor"]
+    notes:
+      - "no cache volume today: a recreate downloads the 330 MiB GGUF once more"
+      - "one CUDA image serves both modes: EMBEDDING_LLAMA_NGL=0 offloads to CPU, 999 puts all layers on the GPU"
+    health: {url: "http://127.0.0.1:18091/health", timeout_s: 5}
+    profiles:
+      cpu:
+        available: true
+        image: localhost/rag-chat_embedding:cuda
+        networks: [models_network]
+        ports: ["127.0.0.1:18091:8091"]
+        volumes: ["rag-chat_embedding-model-cache:/var/cache/huggingface"]
+        env:
+          EMBEDDING_PORT: "8091"
+          EMBEDDING_MODEL: "google/embeddinggemma-2"
+          EMBEDDING_GGUF: "embeddinggemma-2-Q8_0.gguf"
+          EMBEDDING_DIM: "768"
+          EMBEDDING_CONTEXT: "2048"
+          EMBEDDING_MAX_TOKENS: "1024"
+          EMBEDDING_BATCH_SIZE: "16"
+          EMBEDDING_TIMEOUT: "30"
+          EMBEDDING_LLAMA_NGL: "0"
+          HF_HOME: "/var/cache/huggingface"
+          HF_HUB_CACHE: "/var/cache/huggingface/hub"
+          HF_TOKEN: "${HF_TOKEN}"
+        claim: {ram_mib: 1024, vram_mib: 0}
+      gpu:
+        image: localhost/rag-chat_embedding:cuda
+        networks: [models_network]
+        ports: ["127.0.0.1:18091:8091"]
+        devices: ["nvidia.com/gpu=all"]
+        volumes: ["rag-chat_embedding-model-cache:/var/cache/huggingface"]
+        env:
+          EMBEDDING_PORT: "8091"
+          EMBEDDING_MODEL: "google/embeddinggemma-2"
+          EMBEDDING_GGUF: "embeddinggemma-2-Q8_0.gguf"
+          EMBEDDING_DIM: "768"
+          EMBEDDING_CONTEXT: "2048"
+          EMBEDDING_MAX_TOKENS: "1024"
+          EMBEDDING_BATCH_SIZE: "16"
+          EMBEDDING_TIMEOUT: "30"
+          EMBEDDING_LLAMA_NGL: "999"
+          HF_HOME: "/var/cache/huggingface"
+          HF_HUB_CACHE: "/var/cache/huggingface/hub"
+          HF_TOKEN: "${HF_TOKEN}"
+        claim: {ram_mib: 512, vram_mib: 1536}
+
+  - id: llm
+    title: "LLM (Qwen 3.8 Q8)"
+    kind: llm
+    container_name: qwen38
+    preemptible: false
+    consumers: ["gateway llm.filenkov.store"]
+    notes:
+      - "27.05 GiB of weights; ctx 16384 leaves room for one small neighbour, ctx 128000 does not fit"
+      - "--api-key is on the command line: llama-server has no env equivalent"
+    health: {url: "http://127.0.0.1:18001/health", timeout_s: 5}
+    profiles:
+      cpu:
+        available: false
+        reason: "Q8 weights are about 27 GiB of RAM; enable with force, the memory check still applies"
+        image: ghcr.io/ggml-org/llama.cpp:server-cuda12
+        networks: [models_network]
+        ports: ["127.0.0.1:18001:4001"]
+        volumes: ["/media/aleksey/HardDisk/gguf_models:/models:ro"]
+        command:
+          - "--model"
+          - "/models/HuiHui/qwen3.8/model_q8.gguf"
+          - "--ctx-size"
+          - "16384"
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "4001"
+          - "--api-key"
+          - "${LLM_API_KEY}"
+          - "--reasoning"
+          - "off"
+          - "-ngl"
+          - "0"
+        claim: {ram_mib: 32768, vram_mib: 0}
+        startup_timeout_s: 600
+      gpu:
+        image: ghcr.io/ggml-org/llama.cpp:server-cuda12
+        networks: [models_network]
+        ports: ["127.0.0.1:18001:4001"]
+        devices: ["nvidia.com/gpu=all"]
+        volumes: ["/media/aleksey/HardDisk/gguf_models:/models:ro"]
+        command:
+          - "--model"
+          - "/models/HuiHui/qwen3.8/model_q8.gguf"
+          - "--ctx-size"
+          - "16384"
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "4001"
+          - "--api-key"
+          - "${LLM_API_KEY}"
+          - "--reasoning"
+          - "off"
+          - "--flash-attn"
+          - "on"
+          - "-ngl"
+          - "-1"
+        claim: {ram_mib: 2048, vram_mib: 30720}
+        startup_timeout_s: 600
+
+  - id: image
+    title: "Image Gen (Qwen-Image 2.1)"
+    kind: image
+    container_name: qwen-image
+    preemptible: true
+    consumers: ["gateway image.filenkov.store"]
+    notes:
+      - "MEMORY_MODE=offload keeps the DiT partly in RAM: about 8-10 GiB VRAM, 33 GiB RSS"
+      - "int8 mode would need about 20 GiB of VRAM; change MEMORY_MODE and the claim together"
+      - "no CPU vertex: the offload path still needs several GiB of VRAM"
+    health: {url: "http://127.0.0.1:18000/healthz", timeout_s: 10}
+    profiles:
+      gpu:
+        image: localhost/qwen-image-service:latest
+        networks: [models_network]
+        ports: ["127.0.0.1:18000:8000"]
+        devices: ["nvidia.com/gpu=all"]
+        volumes:
+          - "qwen-hf-cache:/data/huggingface"
+          - "qwen-outputs:/data/outputs"
+        shm_size: "8g"
+        memory_limit_mib: 36864
+        calibrate_vram: false
+        env:
+          DEVICE: "cuda"
+          MEMORY_MODE: "offload"
+          TEXT_ENCODER_DEVICE: "cpu"
+          TEXT_ENCODER_GPU_LAYERS: "8"
+          TEXT_ENCODER_DTYPE: "float16"
+          PRELOAD_MODEL: "true"
+          HF_HOME: "/data/huggingface"
+          HF_HUB_ENABLE_HF_TRANSFER: "1"
+          MODEL_ID: "/data/huggingface/Qwen-Image-2.1"
+          OUTPUT_DIR: "/data/outputs"
+          KEEP_OUTPUTS: "200"
+          MAX_STEPS: "60"
+          DEFAULT_STEPS: "40"
+          REQUEST_TIMEOUT: "1800"
+          HF_TOKEN: "${HF_TOKEN}"
+        claim: {ram_mib: 34816, vram_mib: 10240}
+        vram_per_reference_mib: 1024
+        startup_timeout_s: 600
+        stop_grace_s: 60

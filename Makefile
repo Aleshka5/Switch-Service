@@ -11,7 +11,7 @@ RUNTIME ?= fake
 DB ?= var/switch.sqlite
 
 .DEFAULT_GOAL := help
-.PHONY: help venv install test lint run check clean
+.PHONY: help venv install test lint run check clean network network-status doctor
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-10s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -38,6 +38,15 @@ run: $(BIN)/python ## Serve the API on localhost (fake runtime unless RUNTIME=po
 
 check: $(BIN)/python ## Validate CONFIG and print the triangle
 	$(BIN)/switch-service check --config $(CONFIG)
+
+network: ## Create models_network and attach the consumers (no compose)
+	CONFIG=$(CONFIG) ./scripts/models-network.sh up
+
+network-status: ## Show network members and probe the health ports
+	CONFIG=$(CONFIG) ./scripts/models-network.sh status
+
+doctor: ## Preflight GPU, socket, images, ports and the catalogue
+	CONFIG=$(CONFIG) ./scripts/models-network.sh doctor
 
 clean: ## Remove the local venv, caches and the dev database
 	rm -rf $(VENV) .pytest_cache .ruff_cache var

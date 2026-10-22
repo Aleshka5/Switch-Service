@@ -26,12 +26,28 @@ make run
 ```bash
 .venv/bin/switch-service status
 .venv/bin/switch-service state alpha gpu
-.venv/bin/switch-service state alpha cpu
-.venv/bin/switch-service state large gpu          # 409: не влезает рядом с alpha
+.venv/bin/switch-service state large gpu          # 409: 30720 + 4096 > 31232
 .venv/bin/switch-service state large gpu --evict alpha --force
+.venv/bin/switch-service state alpha cpu
 ```
 
 `make run` по умолчанию ничего не запускает в podman и не читает реальную видеокарту: каталог `config/services.yaml` стоит в режиме `sample: fixture`. Так меню можно пощупать на любой машине.
+
+## Реальные модели в одной сети
+
+Топология четырёх моделей — `config/services.models-network.yaml`: одна bridge-сеть `models_network`, без compose и без
+quadlet. Сеть создаёт сам сервис (`host.network` в каталоге), потребители подключаются один раз:
+
+```bash
+make doctor                                        # GPU, сокет, образы, порты, каталог
+make network                                       # создать models_network и подключить gateway/processor/chat
+make run RUNTIME=podman CONFIG=config/services.models-network.yaml
+.venv/bin/switch-service state ocr gpu
+make network-status
+```
+
+Почему пробы живости идут через `127.0.0.1`, а не по имени контейнера, и как мигрировать с compose — в
+[docs/models-network.md](docs/models-network.md).
 
 Почему Makefile — это меню, а не способ держать прод, и как поставить user-systemd на хост с GPU: [docs/operations.md](docs/operations.md).
 

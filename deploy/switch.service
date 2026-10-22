@@ -9,7 +9,8 @@
 
 [Unit]
 Description=Switch service inference control plane
-After=network.target
+After=network.target podman.socket
+Wants=podman.socket
 
 [Service]
 Type=simple
@@ -20,7 +21,7 @@ EnvironmentFile=-%h/projects/Switch-Service/config/secrets.env
 ExecStartPre=/usr/bin/mkdir -p %h/.local/share/switch-service
 ExecStart=%h/projects/Switch-Service/.venv/bin/switch-service serve \
   --host 127.0.0.1 --port 8095 \
-  --config config/services.homelab.example.yaml
+  --config config/services.models-network.yaml
 Restart=on-failure
 RestartSec=2
 

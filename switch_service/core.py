@@ -56,6 +56,8 @@ class SwitchCore:
         self._stop = False
         self._thread: threading.Thread | None = None
         self._counts: dict[tuple[str, str, str], int] = {}
+        self._network_lock = threading.Lock()
+        self._network_ready = catalog.host.network is None
         for service in catalog.services:
             store.ensure_service(service.id)
 
@@ -677,6 +679,7 @@ class SwitchCore:
         before = self.sampler.sample()
         if transition_id:
             self._phase(transition_id, "creating")
+        self._ensure_network()
         self.runtime.ensure(spec)
         if transition_id:
             self._phase(transition_id, "starting")
@@ -856,6 +859,21 @@ class SwitchCore:
             return False
         return self.runtime.probe(spec)
 
+    def _ensure_network(self) -> None:
+        """Create ``host.network`` once per process, before the first container.
+
+        The network is shared by every managed service, so it is created here
+        instead of in a compose file or a quadlet.
+        """
+        network = self.catalog.host.network
+        if not network or self._network_ready:
+            return
+        with self._network_lock:
+            if self._network_ready:
+                return
+            self.runtime.ensure_network(network, self.catalog.host.network_subnet)
+            self._network_ready = True
+
     def _container_spec(self, service: ServiceSpec, profile: Profile, *, recreate: bool) -> ContainerSpec:
         return ContainerSpec(
             name=service.container_name,
@@ -1002,6 +1020,7 @@ class SwitchCore:
             "actor": row.actor,
             "started_at": row.started_at,
             "finished_at": row.finished_at,
+            "duration_ms": row.duration_ms,
             "evict": list(row.evict),
         }
 

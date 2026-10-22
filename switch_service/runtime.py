@@ -35,7 +35,7 @@ class ContainerSpec:
     devices: tuple[str, ...]
     binds: tuple[tuple[str, str, bool], ...]
     volumes: tuple[tuple[str, str, bool], ...]
-    ports: tuple[tuple[int, int], ...]
+    ports: tuple[tuple[str | None, int, int], ...]
     memory_limit_mib: int | None
     shm_size_mib: int | None
     health_url: str | None
@@ -95,6 +95,7 @@ class FakeRuntime:
         self.containers: dict[str, _FakeContainer] = {}
         self.calls: list[tuple[Any, ...]] = []
         self.logs_text: dict[str, str] = {}
+        self.networks: set[str] = set()
         self.fail_modes: set[str] = set()
         self.unhealthy: set[str] = set()
         self.ram_factor = 0.25
@@ -104,6 +105,10 @@ class FakeRuntime:
 
     def ready(self) -> bool:
         return not self.down
+
+    def ensure_network(self, name: str, subnet: str | None = None) -> None:
+        self.calls.append(("ensure_network", name, subnet))
+        self.networks.add(name)
 
     def ensure(self, spec: ContainerSpec) -> None:
         self.calls.append(("ensure", spec.name, spec.mode, spec.config_hash))
@@ -231,8 +236,13 @@ def podman_payload(spec: ContainerSpec) -> dict[str, Any]:
         ]
     if spec.ports:
         body["portmappings"] = [
-            {"host_port": host, "container_port": container, "protocol": "tcp"}
-            for host, container in spec.ports
+            {
+                "host_port": host,
+                "container_port": container,
+                "protocol": "tcp",
+                **({"host_ip": host_ip} if host_ip else {}),
+            }
+            for host_ip, host, container in spec.ports
         ]
     if spec.memory_limit_mib:
         body["resource_limits"] = {"memory": {"limit": spec.memory_limit_mib * 1024 * 1024}}
@@ -267,6 +277,23 @@ class PodmanRuntime:
         except OSError:
             return False
         return status == 200
+
+    def ensure_network(self, name: str, subnet: str | None = None) -> None:
+        """Create the shared bridge network once. 409 means somebody else won the race."""
+        status, raw = self._request("GET", f"/networks/{quote(name)}/json", timeout=10)
+        if status == 200:
+            return
+        if status != 404:
+            raise SwitchError(
+                502, "RUNTIME_FAILED", _podman_message("network inspect", status, raw)
+            )
+        body: dict[str, Any] = {"name": name, "driver": "bridge"}
+        if subnet:
+            body["subnets"] = [subnet]
+        status, raw = self._request("POST", "/networks/create", body=body, timeout=30)
+        if status in {200, 201, 409}:
+            return
+        raise SwitchError(502, "RUNTIME_FAILED", _podman_message("network create", status, raw))
 
     def ensure(self, spec: ContainerSpec) -> None:
         info = self.inspect(spec.name)
