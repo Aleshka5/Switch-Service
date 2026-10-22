@@ -1,0 +1,29 @@
+# Optional local container. The published port is bound to localhost.
+# For the GPU host prefer deploy/switch.service.
+
+services:
+  switch:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      SWITCH_RUNTIME: ${SWITCH_RUNTIME:-fake}
+      SWITCH_DB: /var/lib/switch/state.db
+      CONTAINER_HOST: unix:///run/podman/podman.sock
+    volumes:
+      - switch-data:/var/lib/switch
+      - ../config:/config:ro
+      - ${PODMAN_SOCKET:-/run/podman/podman.sock}:/run/podman/podman.sock
+    command:
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8095"
+      - --config
+      - /config/services.yaml
+    ports:
+      - "127.0.0.1:8095:8095"
+
+volumes:
+  switch-data:

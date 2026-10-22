@@ -1,0 +1,28 @@
+# User systemd unit. This is the recommended way to run the control plane on
+# the GPU host: nvidia-smi and the rootless podman socket both work without
+# mounting them into another container.
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now switch.service
+#
+# loginctl enable-linger "$USER" once, so the unit survives logout.
+
+[Unit]
+Description=Switch service inference control plane
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/Switch-Service
+Environment=SWITCH_RUNTIME=podman
+Environment=SWITCH_DB=%h/.local/share/switch-service/state.db
+EnvironmentFile=-%h/projects/Switch-Service/config/secrets.env
+ExecStartPre=/usr/bin/mkdir -p %h/.local/share/switch-service
+ExecStart=%h/projects/Switch-Service/.venv/bin/switch-service serve \
+  --host 127.0.0.1 --port 8095 \
+  --config config/services.homelab.example.yaml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,30 @@
+# Rootless Quadlet. Use this only when the process must join podman networks
+# for health checks by DNS. On a GPU host the systemd unit is simpler:
+# nvidia-smi works, and the control plane does not itself take the GPU.
+#
+# Do not add nvidia.com/gpu=all here. A CDI device on the control plane can
+# pin VRAM that the admission logic thinks is free.
+
+[Unit]
+Description=Switch service container
+
+[Container]
+Image=localhost/switch-service:latest
+ContainerName=switch
+Network=deploy_auth_network
+Volume=%t/podman/podman.sock:/run/podman/podman.sock:rw
+Volume=%h/.local/share/switch-service:/var/lib/switch:Z
+Environment=CONTAINER_HOST=unix:///run/podman/podman.sock
+Environment=SWITCH_RUNTIME=podman
+Environment=SWITCH_DB=/var/lib/switch/state.db
+# Host nvidia-smi. Driver libraries still have to be visible; if they are
+# not, run deploy/switch.service on the host instead.
+Volume=/usr/bin/nvidia-smi:/usr/bin/nvidia-smi:ro
+Exec=serve --host 0.0.0.0 --port 8095 --config /config/services.yaml
+Volume=%h/projects/Switch-Service/config:/config:ro,Z
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
