@@ -112,6 +112,8 @@ free    = budget - сумма резервов других ready/starting/stopp
 - RAM: `MemAvailable + RSS тех, кого мы остановим - новый клейм >= ram_reserve`. `MemAvailable` уже не содержит RSS запущенных моделей. Второй раз вычитать их клейм нельзя: рядом с image (клейм 32 GiB, свободно ~40 GiB) отказался бы даже OCR на 1 GiB.
 - VRAM: вес сервиса = `max(замер, клейм)`. Неизвестное = `max(0, nvidia_used - сумма весов)`. После плана занято = неизвестное + веса тех, кто остаётся. Свободно = `(total - reserve) - занято`.
 
+Замер — факт о запущенном контейнере, а не история сервиса. `measured_vram_mib` попадает в admission только пока сервис `ready` в режиме `gpu`, `measured_ram_mib` — пока он `ready` в любом режиме. Остановка (`off`, вытеснение) обнуляет оба замера и `measured_at`. Иначе число из прошлого прогона держит карту за выключенный сервис: LLM с замером 28076 MiB после `off` оставлял «84 MiB свободно» на почти пустой карте, и embedder на 1536 MiB не переключался в `gpu`.
+
 Поэтому:
 
 - image с клеймом 20 GiB и простоем 440 MiB не «освобождает» карту. LLM на 30720 MiB рядом не стартует.
@@ -125,7 +127,10 @@ free    = budget - сумма резервов других ready/starting/stopp
 
 - `budget_mib` = `total - reserve` (не `MemAvailable - reserve`);
 - `claimed_mib` = сумма текущих резервов;
-- `free_mib` = `budget - claimed` (на время замены может быть меньше нуля: держится `max(старый, новый)`);
+- `ledger_free_mib` = `budget - claimed` (на время замены может быть меньше нуля: держится `max(старый, новый)`);
+- `live_free_mib` = сколько реально свободно с учётом чужих процессов (для RAM — `MemAvailable - reserve`);
+- `free_mib` = `min(ledger_free_mib, live_free_mib)` и `free_source` — `ledger` или `live`. Это ровно то число, против которого admission будет считать новый клейм, поэтому шапка админки и ошибка `409` не расходятся. Раньше здесь был только журнал: «27.5 GiB free» в шапке при «84 MiB left» в отказе;
+- `unmanaged_mib` (только VRAM) — занято, но ни одному управляемому сервису не принадлежит;
 - `available_mib` у хоста — сырой `MemAvailable`, справочно.
 
 Отказ `409` содержит `required_mib`, `available_mib`, `holders`, `suggestions[]` с `evict`, `frees_*_mib`, `requires_force`, `enough`.

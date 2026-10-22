@@ -19,8 +19,13 @@ Environment=SWITCH_RUNTIME=podman
 Environment=SWITCH_DB=%h/.local/share/switch-service/state.db
 EnvironmentFile=-%h/projects/Switch-Service/config/secrets.env
 ExecStartPre=/usr/bin/mkdir -p %h/.local/share/switch-service
+# 0.0.0.0, not 127.0.0.1: the gateway runs in a container and reaches the host
+# only through the rootless bridge address (host.docker.internal). SWITCH_TOKEN
+# is required for every call except /healthz and /readyz, so the listener is
+# not anonymous. A host firewall should drop 8095 from the LAN if it is not
+# trusted.
 ExecStart=%h/projects/Switch-Service/.venv/bin/switch-service serve \
-  --host 127.0.0.1 --port 8095 \
+  --host 0.0.0.0 --port 8095 \
   --config config/services.models-network.yaml
 Restart=on-failure
 RestartSec=2

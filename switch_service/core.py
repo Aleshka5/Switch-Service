@@ -11,7 +11,14 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from switch_service.admission import Holder, admit
+from switch_service.admission import (
+    Holder,
+    admit,
+    live_free_ram,
+    live_free_vram,
+    unmanaged_vram,
+    vram_weight,
+)
 from switch_service.catalog import Catalog, Profile, ServiceSpec
 from switch_service.errors import SwitchError
 from switch_service.runtime import ContainerSpec, FakeRuntime, PodmanRuntime
@@ -211,21 +218,33 @@ class SwitchCore:
     def snapshot(self) -> dict[str, Any]:
         sample = self.sampler.sample()
         services = [self.service_view(service.id) for service in self.catalog.services]
-        claimed_ram = sum(item["claim"]["ram_mib"] for item in services)
-        claimed_vram = sum(item["claim"]["vram_mib"] for item in services)
-        ram_budget = max(0, sample.ram_total_mib - self.catalog.host.ram_reserve_mib)
+        holders, _ = self._holders()
+        claimed_ram = sum(holder.reserve_ram_mib for holder in holders)
+        claimed_vram = sum(holder.reserve_vram_mib for holder in holders)
+        ram_reserve = self.catalog.host.ram_reserve_mib
+        ram_budget = max(0, sample.ram_total_mib - ram_reserve)
+        ledger_ram, live_ram = live_free_ram(holders, sample, ram_reserve)
         vram_block: dict[str, Any] | None
         if sample.vram_total_mib is None:
             vram_block = None
         else:
-            vram_budget = max(0, sample.vram_total_mib - self.catalog.host.vram_reserve_mib)
+            vram_reserve = self.catalog.host.vram_reserve_mib
+            vram_budget = max(0, sample.vram_total_mib - vram_reserve)
+            ledger_vram = vram_budget - claimed_vram
+            live_vram = live_free_vram(holders, sample, vram_reserve)
+            if live_vram is None:
+                live_vram = ledger_vram
             vram_block = {
                 "total_mib": sample.vram_total_mib,
                 "used_mib": sample.vram_used_mib,
-                "reserve_mib": self.catalog.host.vram_reserve_mib,
+                "reserve_mib": vram_reserve,
                 "budget_mib": vram_budget,
                 "claimed_mib": claimed_vram,
-                "free_mib": vram_budget - claimed_vram,
+                "unmanaged_mib": unmanaged_vram(holders, sample),
+                "ledger_free_mib": ledger_vram,
+                "live_free_mib": live_vram,
+                "free_mib": min(ledger_vram, live_vram),
+                "free_source": "live" if live_vram < ledger_vram else "ledger",
             }
         active = [item["transition"] for item in services if item["transition"]]
         return {
@@ -233,10 +252,13 @@ class SwitchCore:
                 "ram": {
                     "total_mib": sample.ram_total_mib,
                     "available_mib": sample.ram_available_mib,
-                    "reserve_mib": self.catalog.host.ram_reserve_mib,
+                    "reserve_mib": ram_reserve,
                     "budget_mib": ram_budget,
                     "claimed_mib": claimed_ram,
-                    "free_mib": ram_budget - claimed_ram,
+                    "ledger_free_mib": ledger_ram,
+                    "live_free_mib": live_ram,
+                    "free_mib": min(ledger_ram, live_ram),
+                    "free_source": "live" if live_ram < ledger_ram else "ledger",
                 },
                 "vram": vram_block,
                 "cpu": {"threads": sample.cpu_threads, "load1": sample.load1},
@@ -322,7 +344,11 @@ class SwitchCore:
         if over:
             notes.append("measured use is more than 15% above the claim")
         measured = None
-        if row.measured_at and (row.measured_ram_mib is not None or row.measured_vram_mib is not None):
+        if (
+            row.state == "ready"
+            and row.measured_at
+            and (row.measured_ram_mib is not None or row.measured_vram_mib is not None)
+        ):
             measured = {
                 "ram_mib": row.measured_ram_mib,
                 "vram_mib": row.measured_vram_mib,
@@ -549,6 +575,36 @@ class SwitchCore:
             return None
         return {"noop": True, "transition": None}
 
+    def _holders(self) -> tuple[list[Holder], dict[str, bool]]:
+        """What the switch believes each service holds right now.
+
+        A measurement is passed only while the service is ready in a mode that
+        actually holds the resource: a stopped LLM keeps its last 27 GiB reading
+        in the row for history, but the card is free again. Feeding that number
+        to admission made an idle GPU look 84 MiB short.
+        """
+        with self._cv:
+            holders: list[Holder] = []
+            preemptible: dict[str, bool] = {}
+            for item in self.catalog.services:
+                row = self.store.get_service(item.id)
+                running = row.state == "ready" and row.mode in {"cpu", "gpu"}
+                holders.append(
+                    Holder(
+                        id=item.id,
+                        reserve_ram_mib=row.reserve_ram_mib,
+                        reserve_vram_mib=row.reserve_vram_mib,
+                        measured_ram_mib=(row.measured_ram_mib or 0) if running else 0,
+                        measured_vram_mib=(
+                            (row.measured_vram_mib or 0)
+                            if running and row.mode == "gpu"
+                            else 0
+                        ),
+                    )
+                )
+                preemptible[item.id] = item.preemptible
+        return holders, preemptible
+
     def _prepare(
         self,
         service: ServiceSpec,
@@ -568,20 +624,7 @@ class SwitchCore:
             for other in evict:
                 if self.store.active_transition(other):
                     raise SwitchError(423, "BUSY", f"{other} already has a transition in progress")
-            holders = []
-            preemptible: dict[str, bool] = {}
-            for item in self.catalog.services:
-                current = self.store.get_service(item.id)
-                holders.append(
-                    Holder(
-                        id=item.id,
-                        reserve_ram_mib=current.reserve_ram_mib,
-                        reserve_vram_mib=current.reserve_vram_mib,
-                        measured_ram_mib=current.measured_ram_mib or 0,
-                        measured_vram_mib=current.measured_vram_mib or 0,
-                    )
-                )
-                preemptible[item.id] = item.preemptible
+            holders, preemptible = self._holders()
             claim_ram, claim_vram = (0, 0) if profile is None else _claim(profile, options)
             decision = admit(
                 subject=service.title,
@@ -821,6 +864,9 @@ class SwitchCore:
                 mode=None,
                 reserve_ram_mib=0,
                 reserve_vram_mib=0,
+                measured_ram_mib=None,
+                measured_vram_mib=None,
+                measured_at=None,
                 fail_sticky=0,
                 last_error=None,
             )
@@ -916,17 +962,13 @@ class SwitchCore:
         return redact(text, list(self.catalog.secret_values))
 
     def _vram_of(self, service_id: str, used: int) -> int:
-        with self._cv:
-            rows = {row.id: row for row in self.store.list_services()}
+        holders, _ = self._holders()
         accounted = 0
         own = 0
-        for service in self.catalog.services:
-            row = rows.get(service.id)
-            if row is None:
-                continue
-            weight = max(row.measured_vram_mib or 0, row.reserve_vram_mib)
+        for holder in holders:
+            weight = vram_weight(holder)
             accounted += weight
-            if service.id == service_id:
+            if holder.id == service_id:
                 own = weight
         unknown = max(0, used - accounted)
         # Prefer the reservation when this service has not been calibrated yet.

@@ -16,8 +16,9 @@
 # (rootlessport), and `health.url` points there. See docs/models-network.md.
 #
 # Claims: OCR/embedder RAM are measured (1.26 GiB and 630 MiB idle). The image
-# service runs MEMORY_MODE=offload, so its GPU footprint is about 8-10 GiB, not
-# the 20 GiB of the int8 mode. LLM weights are 27.05 GiB.
+# service claims 28 GiB of VRAM: MEMORY_MODE=offload only moves part of the
+# pipeline to RAM, and the switch must not plan a second model onto the card
+# beside it. LLM weights are 27.05 GiB.
 
 host:
   ram_reserve_mib: 8192
@@ -203,14 +204,17 @@ services:
     preemptible: true
     consumers: ["gateway image.filenkov.store"]
     notes:
-      - "MEMORY_MODE=offload keeps the DiT partly in RAM: about 8-10 GiB VRAM, 33 GiB RSS"
-      - "int8 mode would need about 20 GiB of VRAM; change MEMORY_MODE and the claim together"
-      - "no CPU vertex: the offload path still needs several GiB of VRAM"
+      - "claims 28 GiB of VRAM: MEMORY_MODE=offload keeps part of the pipeline in RAM (about 33 GiB RSS), not the whole model off the card"
+      - "int8 mode needs more VRAM than the offload path; change MEMORY_MODE and the claim together"
+      - "no CPU vertex: the offload path still needs most of a 32 GiB card"
     health: {url: "http://127.0.0.1:18000/healthz", timeout_s: 10}
     profiles:
       gpu:
         image: localhost/qwen-image-service:latest
-        networks: [models_network]
+        # deploy_auth_network: after a generate the service POSTs the bundle to
+        # WebStorage `http://app:8000/api/generated` (ADR 0002 in qwen-image-service).
+        # Without it the archive step fails and the answer is saved:false.
+        networks: [models_network, deploy_auth_network]
         ports: ["127.0.0.1:18000:8000"]
         devices: ["nvidia.com/gpu=all"]
         volumes:
@@ -235,7 +239,7 @@ services:
           DEFAULT_STEPS: "40"
           REQUEST_TIMEOUT: "1800"
           HF_TOKEN: "${HF_TOKEN}"
-        claim: {ram_mib: 34816, vram_mib: 10240}
+        claim: {ram_mib: 34816, vram_mib: 28672}
         vram_per_reference_mib: 1024
         startup_timeout_s: 600
         stop_grace_s: 60

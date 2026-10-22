@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import pytest
 
-from switch_service.admission import Holder, Sample, admit
+from switch_service.admission import Holder, Sample, admit, live_free_vram
 from switch_service.errors import SwitchError
 
 RESERVE_RAM = 8192
@@ -64,6 +64,17 @@ def test_live_vram_rejects_unmanaged_usage_the_ledger_cannot_see():
     assert decision.error is not None
     assert decision.error.code == "INSUFFICIENT_VRAM"
     assert decision.error.details["resource"] == "vram"
+
+
+def test_live_free_vram_counts_unmanaged_usage_once():
+    # The claim is the floor for a managed service; whatever nvidia-smi shows
+    # above the sum of weights belongs to nobody and is subtracted as is.
+    image = Holder("image", reserve_ram_mib=1024, reserve_vram_mib=20480)
+    assert live_free_vram([image], sample(vram_used=20000), RESERVE_VRAM) == 32768 - 1536 - 20480
+    assert live_free_vram([image], sample(vram_used=28000), RESERVE_VRAM) == 32768 - 1536 - 28000
+    # Freeing the holder releases its claim, not the unmanaged part.
+    freed = live_free_vram([image], sample(vram_used=28000), RESERVE_VRAM, {"image"})
+    assert freed == 32768 - 1536 - (28000 - 20480)
 
 
 def test_ram_claims_are_not_subtracted_from_memavailable():

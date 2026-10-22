@@ -9,6 +9,11 @@ subtracted from each other:
 
 A start is allowed only when the new claim fits in both. Eviction is a
 permission list: services are stopped only when the fit requires it.
+
+A measurement is a fact about a running container, not about a service's history:
+``SwitchCore`` only passes it for a service that is ready in a mode that holds the
+resource. A 27 GiB reading left over from a stopped LLM must not make the card
+look full.
 """
 
 from __future__ import annotations
@@ -51,8 +56,62 @@ class Decision:
     details: dict[str, Any] = field(default_factory=dict)
 
 
-def _weight_vram(holder: Holder) -> int:
+def vram_weight(holder: Holder) -> int:
+    """VRAM a holder is accounted for: the larger of its measurement and its claim.
+
+    A measurement describes one run of one container. ``SwitchCore`` drops it for
+    a service that is not running, so a stopped service never keeps the card busy.
+    """
     return max(holder.measured_vram_mib, holder.reserve_vram_mib)
+
+
+def unmanaged_vram(holders: list[Holder], sample: Sample) -> int:
+    """GPU memory no managed service accounts for: other processes and the driver."""
+    used = sample.vram_used_mib
+    if used is None:
+        return 0
+    return max(0, used - sum(vram_weight(holder) for holder in holders))
+
+
+def live_free_vram(
+    holders: list[Holder],
+    sample: Sample,
+    vram_reserve_mib: int,
+    freeing: set[str] | None = None,
+) -> int | None:
+    """VRAM the host can hand out right now, counting unmanaged usage.
+
+    ``freeing`` names holders whose footprint is released before the new claim is
+    taken: the switch target (it is replaced, not added to itself) and everything
+    evicted for it.
+    """
+    if sample.vram_total_mib is None or sample.vram_used_mib is None:
+        return None
+    capacity = max(0, sample.vram_total_mib - vram_reserve_mib)
+    gone = freeing or set()
+    held = sum(vram_weight(holder) for holder in holders if holder.id not in gone)
+    return capacity - (unmanaged_vram(holders, sample) + held)
+
+
+def live_free_ram(
+    holders: list[Holder],
+    sample: Sample,
+    ram_reserve_mib: int,
+    freeing: set[str] | None = None,
+) -> tuple[int, int]:
+    """``(ledger_free, live_free)`` for RAM.
+
+    ``MemAvailable`` already excludes the RSS of running models, so their claims
+    are not subtracted again; only the RSS about to be released is added back.
+    """
+    gone = freeing or set()
+    capacity = max(0, sample.ram_total_mib - ram_reserve_mib)
+    ledger = capacity - sum(
+        max(0, holder.reserve_ram_mib) for holder in holders if holder.id not in gone
+    )
+    freed = sum(max(0, holder.measured_ram_mib) for holder in holders if holder.id in gone)
+    live = sample.ram_available_mib + freed - ram_reserve_mib
+    return ledger, live
 
 
 def admit(
@@ -93,18 +152,8 @@ def admit(
         )
 
     def binding(chosen: set[str]) -> dict[str, Any]:
-        held_ram = 0
-        held_vram = 0
-        freed_ram = 0
-        for holder in holders:
-            if holder.id == target_id or holder.id in chosen:
-                freed_ram += max(0, holder.measured_ram_mib)
-                continue
-            held_ram += max(0, holder.reserve_ram_mib)
-            held_vram += max(0, holder.reserve_vram_mib)
-        ram_capacity = max(0, sample.ram_total_mib - ram_reserve_mib)
-        ledger_ram = ram_capacity - held_ram
-        live_ram = sample.ram_available_mib + freed_ram - ram_reserve_mib
+        gone = set(chosen) | {target_id}
+        ledger_ram, live_ram = live_free_ram(holders, sample, ram_reserve_mib, gone)
         numbers: dict[str, Any] = {
             "ledger_ram_mib": ledger_ram,
             "live_ram_mib": live_ram,
@@ -122,19 +171,19 @@ def admit(
             )
             return numbers
         vram_capacity = max(0, sample.vram_total_mib - vram_reserve_mib)
-        ledger_vram = vram_capacity - held_vram
-        weights = {holder.id: _weight_vram(holder) for holder in holders}
-        unknown_vram = max(0, (sample.vram_used_mib or 0) - sum(weights.values()))
-        gone = set(chosen) | {target_id}
-        remain = sum(weight for sid, weight in weights.items() if sid not in gone)
-        live_vram = vram_capacity - (unknown_vram + remain)
+        ledger_vram = vram_capacity - sum(
+            max(0, holder.reserve_vram_mib) for holder in holders if holder.id not in gone
+        )
+        live_vram = live_free_vram(holders, sample, vram_reserve_mib, gone)
+        if live_vram is None:
+            live_vram = ledger_vram
         numbers.update(
             {
                 "ledger_vram_mib": ledger_vram,
                 "live_vram_mib": live_vram,
                 "vram_mib": min(ledger_vram, live_vram),
                 "vram_source": "live" if live_vram < ledger_vram else "ledger",
-                "unmanaged_vram_mib": unknown_vram,
+                "unmanaged_vram_mib": unmanaged_vram(holders, sample),
             }
         )
         return numbers
@@ -271,6 +320,7 @@ def _resource_details(
         "available_vram_after_evict_mib": after["vram_mib"],
         "ram_reserve_mib": ram_reserve,
         "vram_reserve_mib": vram_reserve,
+        "unmanaged_vram_mib": before.get("unmanaged_vram_mib"),
         "holders": [
             {
                 "id": holder.id,

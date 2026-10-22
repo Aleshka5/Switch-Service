@@ -116,13 +116,16 @@ def _status(args: argparse.Namespace) -> int:
     ram = host["ram"]
     print(
         f"RAM free {ram['free_mib']} MiB / budget {ram['budget_mib']} "
-        f"(claimed {ram['claimed_mib']}, reserve {ram['reserve_mib']})"
+        f"(claimed {ram['claimed_mib']}, reserve {ram['reserve_mib']}, "
+        f"ledger {ram['ledger_free_mib']}, source {ram['free_source']})"
     )
     if host["vram"]:
         vram = host["vram"]
         print(
             f"VRAM free {vram['free_mib']} MiB / budget {vram['budget_mib']} "
-            f"(claimed {vram['claimed_mib']}, used {vram['used_mib']})"
+            f"(claimed {vram['claimed_mib']}, used {vram['used_mib']}, "
+            f"unmanaged {vram['unmanaged_mib']}, ledger {vram['ledger_free_mib']}, "
+            f"source {vram['free_source']})"
         )
     else:
         print("VRAM: no sample")

@@ -188,6 +188,107 @@ def test_drift_is_repaired_by_requesting_the_same_state(core):
     assert core.service_view("alpha")["drift"] is False
 
 
+def test_a_stopped_service_does_not_keep_the_card_busy(tmp_path):
+    """The live host, 2026-10-22: the LLM was switched off, its 27.4 GiB
+    measurement stayed in the row, and admission claimed 84 MiB of VRAM left on
+    an almost idle card — so the embedder could not be moved to the GPU."""
+    core = make_core(
+        tmp_path,
+        [
+            service("ocr", gpu_vram=3072, gpu_ram=1024),
+            service("embedding", gpu_vram=1536, gpu_ram=512),
+            service("large", gpu_vram=30720, gpu_ram=2048, preemptible=False, cpu=False),
+        ],
+        fixture={
+            "ram_total_mib": 90112,
+            "ram_available_mib": 70000,
+            "vram_total_mib": 32768,
+            "vram_used_mib": 2836,
+            "cpu_threads": 16,
+            "load1": 0.1,
+        },
+    )
+    try:
+        core.set_state("ocr", "gpu")
+        core.store.update_service(
+            "large",
+            desired_state="off",
+            state="off",
+            mode=None,
+            reserve_ram_mib=0,
+            reserve_vram_mib=0,
+            measured_ram_mib=2048,
+            measured_vram_mib=28076,
+            measured_at="2026-10-22T15:54:33Z",
+        )
+        # The reading stays in the row as history, but neither the view nor
+        # admission may charge it to the card.
+        assert core.store.get_service("large").measured_vram_mib == 28076
+        assert core.service_view("large")["measured"] is None
+        core.set_state("embedding", "gpu")
+        assert core.service_view("embedding")["mode"] == "gpu"
+        vram = core.snapshot()["host"]["vram"]
+        assert vram["claimed_mib"] == 3072 + 1536
+        assert vram["unmanaged_mib"] == 0
+        assert vram["free_mib"] == vram["budget_mib"] - 4608
+    finally:
+        core.close()
+
+
+def test_a_cpu_mode_service_holds_no_vram(tmp_path):
+    core = make_core(tmp_path, [service("alpha")])
+    try:
+        core.set_state("alpha", "cpu")
+        core.store.update_service(
+            "alpha", measured_vram_mib=8000, measured_at="2026-10-22T15:00:00Z"
+        )
+        vram = core.snapshot()["host"]["vram"]
+        assert vram["claimed_mib"] == 0
+        assert vram["free_mib"] == vram["budget_mib"] - 440  # only the idle reading
+    finally:
+        core.close()
+
+
+def test_the_header_free_vram_is_the_number_admission_uses(tmp_path):
+    core = make_core(
+        tmp_path,
+        [service("alpha", gpu_vram=20480)],
+        fixture={
+            "ram_total_mib": 90112,
+            "ram_available_mib": 70000,
+            "vram_total_mib": 32768,
+            "vram_used_mib": 20000,  # someone else's process, no managed service
+            "cpu_threads": 16,
+            "load1": 0.1,
+        },
+    )
+    try:
+        vram = core.snapshot()["host"]["vram"]
+        assert vram["unmanaged_mib"] == 20000
+        assert vram["ledger_free_mib"] == vram["budget_mib"]
+        assert vram["live_free_mib"] == vram["budget_mib"] - 20000
+        assert vram["free_mib"] == vram["live_free_mib"]
+        assert vram["free_source"] == "live"
+        with pytest.raises(SwitchError) as caught:
+            core.set_state("alpha", "gpu")
+        assert caught.value.code == "INSUFFICIENT_VRAM"
+        assert caught.value.details["available_mib"] == vram["free_mib"]
+    finally:
+        core.close()
+
+
+def test_stopping_a_service_forgets_its_measurement(core):
+    core.set_state("alpha", "gpu")
+    core.store.update_service(
+        "alpha", measured_vram_mib=4096, measured_ram_mib=640, measured_at="2026-10-22T15:00:00Z"
+    )
+    core.set_state("alpha", "off")
+    row = core.store.get_service("alpha")
+    assert row.measured_vram_mib is None
+    assert row.measured_ram_mib is None
+    assert core.service_view("alpha")["measured"] is None
+
+
 def test_snapshot_has_no_secret_and_logs_are_redacted(core):
     core.catalog.secret_values = ("llm-test-secret-value",)
     core.runtime.logs_text["alpha"] = (
