@@ -1,0 +1,160 @@
+# Point-in-time example for one host (master-node), copied from the draft
+# measurements of 2026-10-22. Those numbers were not re-measured here.
+# Do not commit real tokens. Export HF_TOKEN and LLM_API_KEY, or point
+# SWITCH_SECRETS at a 0600 file.
+#
+# OCR and the embedder take the GPU/CPU mode from the environment. Their
+# process is a Python entrypoint, so a container command of `--ngl 0` would
+# be passed to Python and the container would exit. The raw llama.cpp image
+# is the one place a server command belongs.
+
+host:
+  ram_reserve_mib: 8192
+  vram_reserve_mib: 1536
+  vram_device: 0
+  reconcile_interval_s: 15
+  observe_cache_s: 2
+  sample: live
+
+defaults:
+  stop_grace_s: 30
+  startup_timeout_s: 300
+  health_timeout_s: 5
+  health_interval_s: 2
+  memory_headroom_mib: 2048
+
+services:
+  - id: ocr
+    title: "OCR (Surya OCR 2)"
+    kind: ocr
+    container_name: ocr
+    preemptible: true
+    consumers: ["rag-chat processor"]
+    notes:
+      - "weights about 1.18 GiB plus a 0.19 GiB mmproj"
+      - "cold start can take several minutes"
+    health: {url: "http://ocr:8090/health", timeout_s: 5}
+    profiles:
+      cpu:
+        image: localhost/rag-chat-ocr:cuda
+        networks: [rag_internal]
+        volumes: ["rag-chat_ocr-model-cache:/var/cache/huggingface"]
+        env: {OCR_TIMEOUT: "120", OCR_LLAMA_NGL: "0", HF_TOKEN: "${HF_TOKEN}"}
+        claim: {ram_mib: 4096, vram_mib: 0}
+        startup_timeout_s: 900
+      gpu:
+        image: localhost/rag-chat-ocr:cuda
+        networks: [rag_internal]
+        devices: ["nvidia.com/gpu=all"]
+        volumes: ["rag-chat_ocr-model-cache:/var/cache/huggingface"]
+        env: {OCR_TIMEOUT: "120", OCR_LLAMA_NGL: "999", HF_TOKEN: "${HF_TOKEN}"}
+        claim: {ram_mib: 1024, vram_mib: 3072}
+        startup_timeout_s: 900
+
+  - id: embedding
+    title: "Embedder (EmbeddingGemma 2)"
+    kind: embedding
+    container_name: embedding
+    preemptible: true
+    consumers: ["rag-chat chat", "rag-chat processor"]
+    health: {url: "http://embedding:8091/health", timeout_s: 5}
+    profiles:
+      cpu:
+        image: localhost/rag-chat-embedding:latest
+        networks: [rag_internal]
+        env: {EMBEDDING_LLAMA_NGL: "0"}
+        claim: {ram_mib: 1024, vram_mib: 0}
+      gpu:
+        image: localhost/rag-chat-embedding:latest
+        networks: [rag_internal]
+        devices: ["nvidia.com/gpu=all"]
+        env: {EMBEDDING_LLAMA_NGL: "999"}
+        claim: {ram_mib: 512, vram_mib: 1536}
+
+  - id: llm
+    title: "LLM (Qwen 3.8 Q8)"
+    kind: llm
+    container_name: qwen38
+    preemptible: false
+    consumers: ["gateway llm.filenkov.store"]
+    notes:
+      - "GPU profile uses ctx 16384. The old ctx 128000 does not fit beside 27 GiB of weights."
+      - "--api-key is on the process command line; llama-server has no env equivalent here."
+    health: {url: "http://qwen38:4001/health", timeout_s: 5}
+    profiles:
+      cpu:
+        available: false
+        reason: "Q8 weights are about 27 GiB of RAM. CPU mode stays off until force is set; the memory check still applies."
+        image: ghcr.io/ggml-org/llama.cpp:server-cuda12
+        networks: [llm_network]
+        volumes: ["/media/aleksey/HardDisk/gguf_models:/models:ro"]
+        command:
+          - "--model"
+          - "/models/HuiHui/qwen3.8/model_q8.gguf"
+          - "--ctx-size"
+          - "16384"
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "4001"
+          - "--api-key"
+          - "${LLM_API_KEY}"
+          - "--reasoning"
+          - "off"
+          - "-ngl"
+          - "0"
+        claim: {ram_mib: 32768, vram_mib: 0}
+        startup_timeout_s: 600
+      gpu:
+        image: ghcr.io/ggml-org/llama.cpp:server-cuda12
+        networks: [llm_network]
+        ports: ["4001:4001"]
+        devices: ["nvidia.com/gpu=all"]
+        volumes: ["/media/aleksey/HardDisk/gguf_models:/models:ro"]
+        command:
+          - "--model"
+          - "/models/HuiHui/qwen3.8/model_q8.gguf"
+          - "--ctx-size"
+          - "16384"
+          - "--host"
+          - "0.0.0.0"
+          - "--port"
+          - "4001"
+          - "--api-key"
+          - "${LLM_API_KEY}"
+          - "--reasoning"
+          - "off"
+          - "--flash-attn"
+          - "on"
+          - "-ngl"
+          - "-1"
+        claim: {ram_mib: 2048, vram_mib: 30720}
+        startup_timeout_s: 600
+
+  - id: image
+    title: "Image Gen (Qwen-Image 2.1)"
+    kind: image
+    container_name: qwen-image
+    preemptible: true
+    consumers: ["gateway image.filenkov.store"]
+    notes:
+      - "No CPU vertex: the offload path still needs several GiB of VRAM."
+      - "Idle VRAM is tiny because the model loads lazily. Admission uses the 20 GiB claim, not nvidia-smi."
+    health: {url: "http://qwen-image:8000/healthz", timeout_s: 10}
+    profiles:
+      gpu:
+        image: localhost/qwen-image-service:latest
+        networks: [qwen_image_gen_network, deploy_auth_network]
+        devices: ["nvidia.com/gpu=all"]
+        volumes:
+          - "qwen-hf-cache:/data/huggingface"
+          - "qwen-outputs:/data/outputs"
+        shm_size: "8g"
+        # Claim plus headroom. The old 64g cgroup was larger than free RAM.
+        memory_limit_mib: 36864
+        env: {MEMORY_MODE: "int8"}
+        claim: {ram_mib: 32768, vram_mib: 20480}
+        vram_per_reference_mib: 2048
+        calibrate_vram: false
+        startup_timeout_s: 600
+        stop_grace_s: 60

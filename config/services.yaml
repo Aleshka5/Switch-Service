@@ -1,0 +1,81 @@
+# Demo catalog. `sample: fixture` does not read this machine, so `make run`
+# works on a laptop. For a real GPU host use config/services.homelab.example.yaml
+# and SWITCH_RUNTIME=podman.
+
+host:
+  ram_reserve_mib: 8192
+  vram_reserve_mib: 1536
+  vram_device: 0
+  reconcile_interval_s: 15
+  observe_cache_s: 2
+  sample: fixture
+  fixture:
+    ram_total_mib: 90112
+    ram_available_mib: 70000
+    vram_total_mib: 32768
+    vram_used_mib: 440
+    cpu_threads: 16
+    load1: 0.1
+    device_name: fixture-gpu
+    compute_cap: "7.0"
+
+defaults:
+  stop_grace_s: 5
+  startup_timeout_s: 30
+  health_timeout_s: 2
+  health_interval_s: 0.5
+  memory_headroom_mib: 2048
+
+services:
+  - id: alpha
+    title: Alpha
+    kind: model
+    preemptible: true
+    consumers: ["demo-client"]
+    notes: ["small model, fits beside beta"]
+    health: {url: "http://alpha:8080/health", timeout_s: 2}
+    profiles:
+      cpu:
+        image: localhost/switch-demo:idle
+        command: ["sleep", "infinity"]
+        claim: {ram_mib: 1024, vram_mib: 0}
+      gpu:
+        image: localhost/switch-demo:idle
+        command: ["sleep", "infinity"]
+        devices: ["nvidia.com/gpu=all"]
+        claim: {ram_mib: 512, vram_mib: 4096}
+
+  - id: beta
+    title: Beta
+    kind: model
+    preemptible: true
+    health: {url: "http://beta:8080/health", timeout_s: 2}
+    profiles:
+      cpu:
+        image: localhost/switch-demo:idle
+        command: ["sleep", "infinity"]
+        claim: {ram_mib: 1024, vram_mib: 0}
+      gpu:
+        image: localhost/switch-demo:idle
+        command: ["sleep", "infinity"]
+        devices: ["nvidia.com/gpu=all"]
+        claim: {ram_mib: 512, vram_mib: 8192}
+
+  - id: large
+    title: Large
+    kind: llm
+    preemptible: false
+    notes: ["GPU profile fills a 32 GiB card; CPU is opt-in via force"]
+    health: {url: "http://large:8080/health", timeout_s: 2}
+    profiles:
+      cpu:
+        available: false
+        reason: "CPU mode is disabled until it is requested with force; admission still applies"
+        image: localhost/switch-demo:idle
+        command: ["sleep", "infinity"]
+        claim: {ram_mib: 32768, vram_mib: 0}
+      gpu:
+        image: localhost/switch-demo:idle
+        command: ["sleep", "infinity"]
+        devices: ["nvidia.com/gpu=all"]
+        claim: {ram_mib: 2048, vram_mib: 30720}
