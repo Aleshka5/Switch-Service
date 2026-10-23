@@ -1,18 +1,22 @@
 # Одна сеть `models_network`, без compose
 
-Четыре модели живут в одной bridge-сети, и создаёт её кто-то один. Владелец сети и владелец контейнеров — один и тот же
-процесс: switch-service. Compose-файл не нужен, quadlet тоже: топология целиком описывается
-`config/services.models-network.yaml`, а сеть и контейнеры создаются из него.
+Четыре модели живут в одной bridge-сети, и создаёт её кто-то один. Владелец сети и владелец контейнеров моделей —
+один и тот же процесс: switch-service. Compose-файл для моделей не нужен, quadlet тоже: топология целиком
+описывается `config/services.models-network.yaml`, а сеть и контейнеры создаются из него.
+
+Единственное исключение — веб-морда генерации картинок: это не модель, карты у неё нет, и живёт она в
+`qwen-image-service/compose.yaml` (`qwen-image`, сеть `deploy_auth_network` плюс `models_network` клиентом).
+Модель (`qwen-inference`, 28 GiB VRAM) — сервис `image` этого каталога.
 
 ```
-                        127.0.0.1:{18090,18091,18001,18000}   ← только health-пробы
+                  127.0.0.1:{18090,18091,18001,18010}   ← только health-пробы (у морды порта нет)
                                      │
- ┌────────────────────────── models_network (bridge, dns) ──────────────────────────┐
- │  ocr:8090      embedding:8091      qwen38:4001      qwen-image:8000               │
- │      ▲               ▲                  ▲                  ▲                     │
- └──────┼───────────────┼──────────────────┼──────────────────┼─────────────────────┘
-        │               │                  │                  │
-  rag-chat_processor_1  rag-chat_chat_1   gateway            gateway
+ ┌────────────────────────── models_network (bridge, dns) ─────────────────────────────────┐
+ │  ocr:8090   embedding:8091   qwen38:4001   qwen-inference:8010   qwen-image:8000         │
+ │      ▲            ▲                ▲               ▲    ▲               ▲                │
+ └──────┼────────────┼────────────────┼───────────────┼────┼───────────────┼────────────────┘
+        │            │                │               │    └── SSE ────────┘                │
+  rag-chat_processor_1  rag-chat_chat_1   gateway   switch          gateway (deploy_auth)
 ```
 
 ## Что в сети
@@ -22,7 +26,8 @@
 | OCR | `http://ocr:8090` | 8090 | `http://127.0.0.1:18090/health` | `ocr` |
 | Embedder | `http://embedding:8091` | 8091 | `http://127.0.0.1:18091/health` | `embedding` |
 | LLM | `http://qwen38:4001` | 4001 | `http://127.0.0.1:18001/health` | `qwen38` |
-| Image Gen | `http://qwen-image:8000` | 8000 | `http://127.0.0.1:18000/healthz` | `qwen-image` |
+| Image Gen — модель (сервис `image`) | `http://qwen-inference:8010` | 8010 | `http://127.0.0.1:18010/healthz` | `qwen-inference` |
+| Image Gen — веб-морда (не сервис switch) | `http://qwen-image:8000` | 8000 | — (порт не публикует) | `qwen-image` |
 
 Потребители, которым нужны эти имена, подключаются к сети один раз: `make network` (скрипт
 `scripts/models-network.sh up`) добавляет в неё `gateway`, `rag-chat_processor_1`, `rag-chat_chat_1`.
@@ -37,15 +42,26 @@
 | `ocr` | `ocr` | `localhost/rag-chat_ocr:cuda` | `cpu` или `gpu` | env `OCR_LLAMA_NGL` (`0` / `999`) |
 | `embedding` | `embedding` | `localhost/rag-chat_embedding:cuda` | `cpu` или `gpu` | env `EMBEDDING_LLAMA_NGL` (`0` / `999`) |
 | `llm` | `qwen38` | `ghcr.io/ggml-org/llama.cpp:server-cuda12` | `gpu` (cpu только с `force`) | `-ngl -1` в command |
-| `image` | `qwen-image` | `localhost/qwen-image-service:latest` | только `gpu` | — (CPU-профиля нет) |
+| `image` | `qwen-inference` | `localhost/qwen-inference:latest` (`Dockerfile`) | только `gpu` | — (CPU-профиля нет: offload-путь всё равно занимает почти всю карту) |
+
+`qwen-image-service` разрезан на два независимых контейнера (ADR 0011 и 0012 в его репозитории): пайплайн с
+весами и картой — `qwen-inference` (это и есть сервис `image` каталога: 28672 MiB VRAM, `qwen-hf-cache`,
+`nvidia.com/gpu=all`), Flask-оркестратор — `qwen-image` (0 VRAM, том `qwen-outputs`, 1 GiB RAM, сеть
+`deploy_auth_network`). Морда обращается к модели по имени `http://qwen-inference:8010`
+(`POST /v1/generate` → `text/event-stream`), поэтому она состоит и в `models_network` — клиентом, только ради
+резолва имени. Если модель не запущена (`state image off`), `/healthz` морды отдаёт `inference недоступен`, а
+каждая генерация — `503`; сама морда при этом продолжает работать.
+Запуск модели вне switch (хост без него) описан в `Common/models/services/inference` — там же `run.sh`, который
+отказывается стартовать, пока имя `qwen-inference` принадлежит каталогу.
 
 Один CUDA-образ на сервис обслуживает оба режима: `-ngl 0` не переносит ни одного слоя на карту. Поэтому переключение
 CPU↔GPU — это пересоздание контейнера с другим env, а не пересборка. Проверено на живой машине: в `cpu` llama-server
 запускается с `-ngl 0`, в `gpu` — с `-ngl 999` и занимает 2680 MiB (OCR) / 690 MiB (embedding) VRAM.
 
-Управляет всем `switch.service` (юзер-юнит, `127.0.0.1:8095`, `SWITCH_DB` в `~/.local/share/switch-service/state.db`).
-`qwen-image` больше не квадлет: файл `~/.config/containers/systemd/qwen-image.container` удалён, `Restart=always` больше
-не возвращает выключенный контейнер.
+Управляет моделями `switch.service` (юзер-юнит, `127.0.0.1:8095`, `SWITCH_DB` в `~/.local/share/switch-service/state.db`).
+`qwen-inference` больше не квадлет и не compose-контейнер: файл `~/.config/containers/systemd/qwen-image.container`
+удалён, `Restart=always` больше не возвращает выключенную модель (`restart_policy: no` у контейнеров switch).
+Веб-морда, наоборот, живёт под compose с `restart: always`: её перезапуск не стоит ничего.
 
 ## Почему health-проба идёт через loopback, а не по имени
 

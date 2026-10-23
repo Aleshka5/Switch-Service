@@ -35,16 +35,31 @@ make run
 
 ## Реальные модели в одной сети
 
-Топология четырёх моделей — `config/services.models-network.yaml`: одна bridge-сеть `models_network`, без compose и без
-quadlet. Сеть создаёт сам сервис (`host.network` в каталоге), потребители подключаются один раз:
+Топология четырёх моделей — `config/services.models-network.yaml`: одна bridge-сеть
+`models_network`, без compose и без quadlet для моделей. Сеть создаёт сам сервис (`host.network` в каталоге),
+потребители подключаются один раз:
 
 ```bash
 make doctor                                        # GPU, сокет, образы, порты, каталог
 make network                                       # создать models_network и подключить gateway/processor/chat
 make run RUNTIME=podman CONFIG=config/services.models-network.yaml
 .venv/bin/switch-service state ocr gpu
+.venv/bin/switch-service state image gpu            # карта, torch и веса — контейнер qwen-inference
 make network-status
 ```
+
+`qwen-image-service` разрезан на два независимых контейнера (ADR 0011 и 0012 в его репозитории), и сервисом
+каталога является только один из них — модель:
+
+| Что | Контейнер | Кто запускает | Сеть | VRAM |
+|---|---|---|---|---|
+| модель, `state image gpu` | `qwen-inference` | switch (каталог) | `models_network` | 28672 MiB |
+| веб-морда (Flask, UI, WebStorage) | `qwen-image` | `qwen-image-service/compose.yaml` | `deploy_auth_network` + `models_network` клиентом | 0 |
+
+Веб-морда — не сервис switch: у неё нет ни карты, ни весов, и перезапускается она сколько угодно часто, не
+трогая 33 GiB тёплых весов. В пайплайн она ходит по имени `http://qwen-inference:8010`, поэтому состоит в
+`models_network`, но карту делит только через switch. Если поднять её, а модель не запустить, `/healthz`
+отдаёт `inference unreachable`, а каждая генерация — `503`.
 
 Почему пробы живости идут через `127.0.0.1`, а не по имени контейнера, и как мигрировать с compose — в
 [docs/models-network.md](docs/models-network.md).
@@ -82,7 +97,7 @@ HTTP (`switch-service serve`) нужен, когда вызывающий код
 ## Контракт состояний
 
 - `off → cpu`, `off → gpu`, `cpu → gpu`, `gpu → cpu`, `cpu → off`, `gpu → off`.
-- Нет профиля (у image нет CPU) или профиль помечен `available: false` — ребро всё равно есть, ответ `422` с причиной. `force` открывает только `available: false` и не отключает проверку памяти.
+- Нет профиля (у `image` нет CPU: это модель, ей нужна карта) или профиль помечен `available: false` — ребро всё равно есть, ответ `422` с причиной. `force` открывает только `available: false` и не отключает проверку памяти.
 - `409` означает «не влезает» и не меняет контейнеры. В теле есть `required_mib`, `available_mib` и кого можно остановить.
 - Пока переход идёт, следующий запрос получает `423`.
 
