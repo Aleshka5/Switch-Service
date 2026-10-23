@@ -6,19 +6,23 @@
 #   make run RUNTIME=podman CONFIG=config/services.models-network.yaml
 #
 # Names inside models_network are the container names below (`ocr`,
-# `embedding`, `qwen38`, `qwen-image`). Consumers resolve them by that name:
+# `embedding`, `qwen38`, `qwen-inference`). Consumers resolve them by that name:
 # rag-chat processor -> http://ocr:8090, chat -> http://embedding:8091,
-# gateway -> http://qwen38:4001 and http://qwen-image:8000.
+# gateway -> http://qwen38:4001 and http://qwen-image:8000. `qwen-image` is the
+# web face (Flask, UI, WebStorage) from qwen-image-service/compose.yaml: it is not a
+# switch service, it holds no card, and it calls the pipeline in this catalogue as
+# http://qwen-inference:8010 from the same network.
 #
 # Health probes do not go over that network: a rootless podman container is
 # not reachable from the host by IP, and container names do not resolve on the
 # host. Each service therefore publishes its health port on 127.0.0.1 only
 # (rootlessport), and `health.url` points there. See docs/models-network.md.
 #
-# Claims: OCR/embedder RAM are measured (1.26 GiB and 630 MiB idle). The image
-# service claims 28 GiB of VRAM: MEMORY_MODE=offload only moves part of the
-# pipeline to RAM, and the switch must not plan a second model onto the card
-# beside it. LLM weights are 27.05 GiB.
+# Claims: OCR/embedder RAM are measured (1.26 GiB, and 1.5 GiB for the embedder
+# with its vision projector). The `image`
+# service claims 28 GiB of VRAM and is the model — torch, the weights, the card:
+# MEMORY_MODE=offload only moves part of the pipeline to RAM, and the switch must
+# not plan a second model onto the card beside it. LLM weights are 27.05 GiB.
 
 host:
   ram_reserve_mib: 8192
@@ -91,8 +95,9 @@ services:
     preemptible: true
     consumers: ["rag-chat chat", "rag-chat processor"]
     notes:
-      - "no cache volume today: a recreate downloads the 330 MiB GGUF once more"
+      - "weights 310 MiB GGUF + 530 MiB vision projector, cached in rag-chat_embedding-model-cache"
       - "one CUDA image serves both modes: EMBEDDING_LLAMA_NGL=0 offloads to CPU, 999 puts all layers on the GPU"
+      - "the projector is what makes POST /embed/image work; measured one instance at 1426 MiB VRAM with it (690 without) and 1515 MiB RSS on CPU"
     health: {url: "http://127.0.0.1:18091/health", timeout_s: 5}
     profiles:
       cpu:
@@ -105,16 +110,19 @@ services:
           EMBEDDING_PORT: "8091"
           EMBEDDING_MODEL: "google/embeddinggemma-2"
           EMBEDDING_GGUF: "embeddinggemma-2-Q8_0.gguf"
+          EMBEDDING_MMPROJ: "mmproj-embeddinggemma-2-Q8_0.gguf"
           EMBEDDING_DIM: "768"
           EMBEDDING_CONTEXT: "2048"
           EMBEDDING_MAX_TOKENS: "1024"
           EMBEDDING_BATCH_SIZE: "16"
+          EMBEDDING_MAX_IMAGES: "4"
+          EMBEDDING_MAX_IMAGE_BYTES: "10485760"
           EMBEDDING_TIMEOUT: "30"
           EMBEDDING_LLAMA_NGL: "0"
           HF_HOME: "/var/cache/huggingface"
           HF_HUB_CACHE: "/var/cache/huggingface/hub"
           HF_TOKEN: "${HF_TOKEN}"
-        claim: {ram_mib: 1024, vram_mib: 0}
+        claim: {ram_mib: 1792, vram_mib: 0}
       gpu:
         image: localhost/rag-chat_embedding:cuda
         networks: [models_network]
@@ -125,16 +133,19 @@ services:
           EMBEDDING_PORT: "8091"
           EMBEDDING_MODEL: "google/embeddinggemma-2"
           EMBEDDING_GGUF: "embeddinggemma-2-Q8_0.gguf"
+          EMBEDDING_MMPROJ: "mmproj-embeddinggemma-2-Q8_0.gguf"
           EMBEDDING_DIM: "768"
           EMBEDDING_CONTEXT: "2048"
           EMBEDDING_MAX_TOKENS: "1024"
           EMBEDDING_BATCH_SIZE: "16"
+          EMBEDDING_MAX_IMAGES: "4"
+          EMBEDDING_MAX_IMAGE_BYTES: "10485760"
           EMBEDDING_TIMEOUT: "30"
           EMBEDDING_LLAMA_NGL: "999"
           HF_HOME: "/var/cache/huggingface"
           HF_HUB_CACHE: "/var/cache/huggingface/hub"
           HF_TOKEN: "${HF_TOKEN}"
-        claim: {ram_mib: 512, vram_mib: 1536}
+        claim: {ram_mib: 1024, vram_mib: 2304}
 
   - id: llm
     title: "LLM (Qwen 3.8 Q8)"
@@ -197,29 +208,32 @@ services:
         claim: {ram_mib: 2048, vram_mib: 30720}
         startup_timeout_s: 600
 
+  # The image generation service. One container, one vertex: the model. The web face
+  # (Flask, UI, JSON API, WebStorage) is NOT a switch service — it holds no card, and it
+  # lives in qwen-image-service/compose.yaml, joined to models_network as a client only so
+  # that the name `qwen-inference` resolves. Launching the model here is the whole job:
+  # `state image gpu`.
   - id: image
     title: "Image Gen (Qwen-Image 2.1)"
     kind: image
-    container_name: qwen-image
+    container_name: qwen-inference
     preemptible: true
-    consumers: ["gateway image.filenkov.store"]
+    consumers: ["gateway image.filenkov.store (through qwen-image)"]
     notes:
-      - "claims 28 GiB of VRAM: MEMORY_MODE=offload keeps part of the pipeline in RAM (about 33 GiB RSS), not the whole model off the card"
+      - "the model: torch, the weights and the card; there is no CPU vertex, the offload path still needs most of a 32 GiB card"
+      - "claims 28 GiB of VRAM; measured peak 14.2 GiB in a 2048² job with RSS 31.7 GiB, so the claim is really about not planning a second model beside it"
       - "int8 mode needs more VRAM than the offload path; change MEMORY_MODE and the claim together"
-      - "no CPU vertex: the offload path still needs most of a 32 GiB card"
-    health: {url: "http://127.0.0.1:18000/healthz", timeout_s: 10}
+      - "POST /v1/generate -> text/event-stream; the web face reads it as SSE (qwen-image-service/docs/inference_api.md)"
+      - "launch code outside the switch: Common/models/services/inference (compose + run.sh); one owner at a time or the reconciler recreates the container"
+    health: {url: "http://127.0.0.1:18010/healthz", timeout_s: 10}
     profiles:
       gpu:
-        image: localhost/qwen-image-service:latest
-        # deploy_auth_network: after a generate the service POSTs the bundle to
-        # WebStorage `http://app:8000/api/generated` (ADR 0002 in qwen-image-service).
-        # Without it the archive step fails and the answer is saved:false.
-        networks: [models_network, deploy_auth_network]
-        ports: ["127.0.0.1:18000:8000"]
+        image: localhost/qwen-inference:latest
+        networks: [models_network]
+        ports: ["127.0.0.1:18010:8010"]
         devices: ["nvidia.com/gpu=all"]
         volumes:
           - "qwen-hf-cache:/data/huggingface"
-          - "qwen-outputs:/data/outputs"
         shm_size: "8g"
         memory_limit_mib: 36864
         calibrate_vram: false
@@ -228,16 +242,25 @@ services:
           MEMORY_MODE: "offload"
           TEXT_ENCODER_DEVICE: "cpu"
           TEXT_ENCODER_GPU_LAYERS: "8"
+          TEXT_ENCODER_GPU_VISION: "true"
           TEXT_ENCODER_DTYPE: "float16"
+          ATTENTION_BACKEND: "native"
+          VAE_TILING: "true"
+          VAE_SLICING: "true"
+          VAE_TILE_SIZE: "1536"
+          PIPELINE_CLASS: "auto"
           PRELOAD_MODEL: "true"
           HF_HOME: "/data/huggingface"
-          HF_HUB_ENABLE_HF_TRANSFER: "1"
+          HF_XET_HIGH_PERFORMANCE: "1"
           MODEL_ID: "/data/huggingface/Qwen-Image-2.1"
-          OUTPUT_DIR: "/data/outputs"
-          KEEP_OUTPUTS: "200"
+          PORT: "8010"
           MAX_STEPS: "60"
           DEFAULT_STEPS: "40"
-          REQUEST_TIMEOUT: "1800"
+          DEFAULT_TRUE_CFG_SCALE: "1.0"
+          MIN_SIDE: "512"
+          MAX_SIDE: "2752"
+          MAX_IMAGES: "10"
+          MAX_UPLOAD_MB: "60"
           HF_TOKEN: "${HF_TOKEN}"
         claim: {ram_mib: 34816, vram_mib: 28672}
         vram_per_reference_mib: 1024
